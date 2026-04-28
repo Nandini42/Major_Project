@@ -1,38 +1,42 @@
 import React from "react";
+import { Link } from "react-router-dom";
 
 const Navbar = () => {
   return (
-    <nav style={styles.nav}>
-      <h2 style={styles.logo}>NewsClassifier AI</h2>
-      <div style={styles.links}>
-        <a href="/" style={styles.link}>Home</a>
-        <a href="/" style={styles.link}>Classify</a>
-        <a href="/" style={styles.link}>About</a>
+    <nav className="flex justify-between items-center px-8 py-4 bg-gray-900 text-white shadow">
+
+      {/* LOGO */}
+      <h2 className="text-xl font-bold">
+        NewsClassifier AI
+      </h2>
+
+      {/* LINKS */}
+      <div className="flex gap-6 items-center">
+
+        <Link 
+          to="/" 
+          className="hover:text-green-400 transition"
+        >
+          Home
+        </Link>
+
+        <Link 
+          to="/classifier"   // ✅ FIXED
+          className="hover:text-green-400 transition"
+        >
+          Classify
+        </Link>
+
+        <Link 
+          to="/about" 
+          className="hover:text-green-400 transition"
+        >
+          About
+        </Link>
+
       </div>
     </nav>
   );
-};
-
-const styles = {
-  nav: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: "15px 40px",
-    backgroundColor: "#1f2937",
-    color: "white"
-  },
-  logo: {
-    margin: 0
-  },
-  links: {
-    display: "flex",
-    gap: "20px"
-  },
-  link: {
-    color: "white",
-    textDecoration: "none"
-  }
 };
 
 export default Navbar;

@@ -330,24 +330,25 @@
 #     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
 
 import os
+import re
 import time
+import requests
 import threading
 from datetime import datetime, timedelta
-import re
+from pathlib import Path
 
 import numpy as np
 import faiss
-import requests
 import torch
 import joblib
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from sentence_transformers import SentenceTransformer
+
 from transformers import BertTokenizer, BertForSequenceClassification, BertModel
+from sentence_transformers import SentenceTransformer
+
 from google import genai
-from pathlib import Path
-import joblib
 
 # ---------------------------------------------------
 # CONFIG
@@ -355,12 +356,18 @@ import joblib
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+if not GEMINI_API_KEY:
+    raise ValueError("Missing GEMINI_API_KEY")
+
+if not GNEWS_API_KEY:
+    raise ValueError("Missing GNEWS_API_KEY")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
 CORS(app)
 
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------
 # LABEL MAP
@@ -382,41 +389,31 @@ def preprocess_text(text):
     return text.strip()
 
 # ---------------------------------------------------
-# 🤖 LOAD ALL MODELS
+# LOAD MODELS
 # ---------------------------------------------------
-from pathlib import Path
-import torch
-import joblib
-from transformers import BertTokenizer, BertForSequenceClassification, BertModel
-
-# Check for device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 print("Loading models...")
 
-# ---------------- BASE DIRECTORY ----------------
-# Use resolve() to get the absolute path
 base_dir = Path(__file__).resolve().parent / "saved_models"
 
-# ---------------- BERT ----------------
+# ---- BERT (Fine-tuned) ----
 model_path = base_dir / "FineTuned_BERT"
 
-if not model_path.exists():
-    raise FileNotFoundError(f"Could not find model directory at {model_path}")
-
-# USE .as_posix() to convert 'C:\...' to 'C:/...' for transformers compatibility
-bert_tokenizer = BertTokenizer.from_pretrained(model_path.as_posix(), local_files_only=True)
-bert_model = BertForSequenceClassification.from_pretrained(model_path.as_posix(), local_files_only=True)
-bert_model.to(device)
+bert_tokenizer = BertTokenizer.from_pretrained(
+    model_path.as_posix(), local_files_only=True
+)
+bert_model = BertForSequenceClassification.from_pretrained(
+    model_path.as_posix(), local_files_only=True
+).to(device)
 bert_model.eval()
 
-# ---------------- BERT BASE ----------------
-# Note: This usually requires internet unless already cached locally
-bert_base = BertModel.from_pretrained("bert-base-uncased")
-bert_base.to(device)
+# ---- BERT BASE ----
+bert_base = BertModel.from_pretrained(
+    "bert-base-uncased",
+    local_files_only=True
+).to(device)
 bert_base.eval()
 
-# ---------------- NAIVE BAYES ----------------
+# ---- NAIVE BAYES ----
 nb_bow = joblib.load(base_dir / "NaiveBayes_BoW_model.pkl")
 vec_bow = joblib.load(base_dir / "NaiveBayes_BoW_vectorizer.pkl")
 
@@ -426,7 +423,7 @@ vec_tfidf = joblib.load(base_dir / "NaiveBayes_TFIDF_vectorizer.pkl")
 nb_bert = joblib.load(base_dir / "NaiveBayes_BERT_model.pkl")
 scaler_bert = joblib.load(base_dir / "NaiveBayes_BERT_scaler.pkl")
 
-# ---------------- LSTM CLASSES ----------------
+# ---- LSTM MODELS ----
 class SimpleLSTM(torch.nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -438,6 +435,7 @@ class SimpleLSTM(torch.nn.Module):
         _, (hn, _) = self.lstm(x)
         return self.fc(hn[-1])
 
+
 class BertLSTM(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -448,7 +446,7 @@ class BertLSTM(torch.nn.Module):
         _, (hn, _) = self.lstm(x)
         return self.fc(hn[-1])
 
-# ---------------- LOAD LSTM WEIGHTS ----------------
+
 bow_dim = vec_bow.transform(["test"]).shape[1]
 tfidf_dim = vec_tfidf.transform(["test"]).shape[1]
 
@@ -470,48 +468,48 @@ print("✅ All models loaded successfully")
 # HELPER: BERT EMBEDDING
 # ---------------------------------------------------
 def get_bert_embedding(text):
-    inputs = bert_tokenizer(text, return_tensors="pt", truncation=True, padding='max_length', max_length=64)
+    inputs = bert_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding='max_length',
+        max_length=64
+    ).to(device)
+
     with torch.no_grad():
         outputs = bert_base(**inputs)
-    return outputs.last_hidden_state[:, 0, :].numpy()
+
+    return outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
 # ---------------------------------------------------
-# 🔮 MODEL PREDICTIONS
+# PREDICTIONS
 # ---------------------------------------------------
 def predict_all_models(text):
     text = preprocess_text(text)
     results = {}
 
-    # NB BoW
     results["NaiveBayes_BoW"] = label_map[int(nb_bow.predict(vec_bow.transform([text]))[0])]
-
-    # NB TFIDF
     results["NaiveBayes_TFIDF"] = label_map[int(nb_tfidf.predict(vec_tfidf.transform([text]))[0])]
 
-    # NB BERT
     emb = get_bert_embedding(text)
     emb = scaler_bert.transform(emb)
     emb = (emb * 1000).astype(int)
     results["NaiveBayes_BERT"] = label_map[int(nb_bert.predict(emb)[0])]
 
-    # LSTM BoW
-    X = torch.tensor(vec_bow.transform([text]).toarray(), dtype=torch.float32)
+    X = torch.tensor(vec_bow.transform([text]).toarray(), dtype=torch.float32).to(device)
     with torch.no_grad():
         results["LSTM_BoW"] = label_map[int(torch.argmax(lstm_bow(X), dim=1).item())]
 
-    # LSTM TFIDF
-    X = torch.tensor(vec_tfidf.transform([text]).toarray(), dtype=torch.float32)
+    X = torch.tensor(vec_tfidf.transform([text]).toarray(), dtype=torch.float32).to(device)
     with torch.no_grad():
         results["LSTM_TFIDF"] = label_map[int(torch.argmax(lstm_tfidf(X), dim=1).item())]
 
-    # LSTM BERT
     emb = np.expand_dims(get_bert_embedding(text), 1)
-    X = torch.tensor(emb, dtype=torch.float32)
+    X = torch.tensor(emb, dtype=torch.float32).to(device)
     with torch.no_grad():
         results["LSTM_BERT"] = label_map[int(torch.argmax(lstm_bert(X), dim=1).item())]
 
-    # Fine-tuned BERT
-    inputs = bert_tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    inputs = bert_tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
     with torch.no_grad():
         logits = bert_model(**inputs).logits
         results["FineTuned_BERT"] = label_map[int(torch.argmax(logits, dim=1).item())]
@@ -519,50 +517,108 @@ def predict_all_models(text):
     return results
 
 # ---------------------------------------------------
-# 📊 PREDICT API
+# PREDICT API
 # ---------------------------------------------------
+def fetch_related_news(query):
+    url = "https://gnews.io/api/v4/search"
+
+    res = requests.get(url, params={
+        "q": query,
+        "lang": "en",
+        "max": 8,   # 🔥 important for 20+ lines
+        "apikey": GNEWS_API_KEY
+    })
+
+    if res.status_code != 200:
+        return []
+
+    articles = []
+    for a in res.json().get("articles", []):
+        articles.append({
+            "title": a["title"],
+            "description": a.get("description", ""),
+            "url": a["url"]
+        })
+
+    return articles
+
+
+def format_news_content(articles):
+    content = ""
+
+    for i, a in enumerate(articles, 1):
+        content += f"{i}. {a['title']}\n"
+        
+        if a.get("description"):
+            content += f"{a['description']}\n"
+        
+        content += f"Read more: {a['url']}\n\n"
+
+    return content.strip()
+
 @app.route("/predict", methods=["POST"])
 def predict():
+    import json
+
     data = request.get_json() or {}
     text = data.get("text", "").strip()
-    model_name = data.get("model", "ALL")
 
     if not text:
         return jsonify({"error": "Text required"}), 400
 
-    if model_name == "ALL":
-        return jsonify({"results": predict_all_models(text)})
-
-    # Single model selection
+    # 🔹 1. Classification
     all_results = predict_all_models(text)
-    return jsonify({"results": {model_name: all_results.get(model_name)}})
+    prediction = all_results.get("FineTuned_BERT", "Unknown")
+
+    news_articles = []
+    news_content = ""
+
+    try:
+        # 🔹 2. Extract topic using Gemini
+        prompt = f"""
+        Extract the main topic from this news text in 2-4 words.
+
+        Text:
+        {text}
+        """
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        topic = response.text.strip()
+
+        # 🔹 3. Fetch real news
+        if topic:
+            news_articles = fetch_related_news(topic)
+            news_content = format_news_content(news_articles)
+
+    except Exception as e:
+        print("Error:", e)
+        topic = "Unknown"
+
+    # 🔹 4. Final response
+    return jsonify({
+        "prediction": prediction,
+        "topic": topic,
+        "news_articles": news_articles,
+        "news_content": news_content,
+        "all_model_predictions": all_results
+    })
 
 # ---------------------------------------------------
-# 📰 CHATBOT (UNCHANGED)
+# CHATBOT
 # ---------------------------------------------------
 print("Loading embedding model...")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
 articles_store = []
 index = None
-
-import re
-
-def clean_response(text):
-    # remove bold ** **
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-
-    # remove bullet points (*, -, etc.)
-    text = re.sub(r"^\s*[\*\-\•]\s*", "", text, flags=re.MULTILINE)
-
-    # remove extra spaces
-    text = re.sub(r"\n+", "\n", text)
-
-    return text.strip()
 
 def fetch_news():
     base_url = "https://gnews.io/api/v4/search"
     from_date = (datetime.utcnow() - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    all_articles = []
 
     res = requests.get(base_url, params={
         "q": "news",
@@ -572,49 +628,133 @@ def fetch_news():
         "apikey": GNEWS_API_KEY
     })
 
+    if res.status_code != 200:
+        return []
+
+    all_articles = []
     for a in res.json().get("articles", []):
         text = f"{a.get('title','')} {a.get('description','')}"
-        all_articles.append({"embed_text": text, "title": a["title"], "url": a["url"]})
+        all_articles.append({
+            "embed_text": text,
+            "title": a["title"],
+            "url": a["url"]
+        })
 
     return all_articles
 
 def build_index():
     global articles_store, index
+
     articles_store = fetch_news()
     if not articles_store:
+        index = None
         return
 
     texts = [a["embed_text"] for a in articles_store]
     emb = embedder.encode(texts).astype("float32")
-    faiss.normalize_L2(emb)
 
+    faiss.normalize_L2(emb)
     index = faiss.IndexFlatIP(emb.shape[1])
     index.add(emb)
 
 build_index()
 
-@app.route("/chat", methods=["POST"])
-def chat():
-    data = request.get_json()
-    question = data.get("question", "")
+def clean_response(text):
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"^\s*[\*\-\•]\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n+", "\n", text)
+    return text.strip()
 
-    q_emb = embedder.encode([question]).astype("float32")
-    faiss.normalize_L2(q_emb)
+def generate_highlights(news_content):
+    prompt = f"""
+    Convert the following news into 5-7 short highlight points.
 
-    _, idx = index.search(q_emb, 3)
-    context = "\n".join([articles_store[i]["title"] for i in idx[0]])
+    Rules:
+    - No URLs
+    - No repetition
+    - Keep each line short (1 sentence)
+    - Focus only on important updates
 
-    prompt = f"Answer based on news:\n{context}\n\nQuestion:{question}"
+    News:
+    {news_content}
+    """
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt
     )
-    cleaned = clean_response(response.text)
 
-    return jsonify({
-        "answer": cleaned
-    })
+    return response.text
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json() or {}
+    question = data.get("question", "").strip()
+
+    if not question:
+        return jsonify({"answer": "Please enter a question."})
+
+    answer = ""
+
+    try:
+        # 🔹 1. Extract topic
+        prompt = f"""
+        Extract the main topic in 2-4 words from:
+        {question}
+        """
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        topic = response.text.strip()
+
+        # 🔹 2. Fetch real news
+        news_articles = []
+        news_content = ""
+
+        if topic:
+            news_articles = fetch_related_news(topic)
+
+        # 🔹 3. If news available → use it
+        if news_articles:
+            news_content = format_news_content(news_articles)
+            answer = news_content
+
+        else:
+            # 🔥 4. Fallback to Gemini (VERY IMPORTANT)
+            fallback_prompt = f"""
+            Give latest highlights about the following topic.
+
+            Topic: {question}
+
+            Instructions:
+            - 5 to 10 short lines
+            - Focus on recent updates or context
+            - Avoid generic textbook explanation
+            """
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=fallback_prompt
+            )
+
+            if hasattr(response, "text") and response.text:
+                answer = response.text
+            elif hasattr(response, "candidates"):
+                answer = response.candidates[0].content.parts[0].text
+            else:
+                answer = "No information available."
+        raw_content = format_news_content(news_articles)
+        answer = generate_highlights(raw_content)
+        answer = clean_response(answer)
+
+    except Exception as e:
+        print("Error:", e)
+        answer = "Sorry, I couldn't generate a response."
+
+    return jsonify({"answer": answer})
 
 # ---------------------------------------------------
 # RUN
